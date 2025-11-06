@@ -2,37 +2,15 @@ const express = require("express");
 const ffmpeg = require("fluent-ffmpeg");
 const fs = require("fs");
 const path = require("path");
-require("dotenv").config();
+
+// IMPORTANT for TERMUX
+ffmpeg.setFfmpegPath("/data/data/com.termux/files/usr/bin/ffmpeg");
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
 app.use(express.json({ limit: "50mb" }));
 app.use("/merge", express.static(path.join(__dirname, "merge")));
 
-// Create merge directory if it doesn't exist
-if (!fs.existsSync("./merge")) {
-  fs.mkdirSync("./merge");
-  console.log("✅ Created ./merge directory");
-}
-
-// Helper function to check if string is a URL
-function isURL(str) {
-  return /^https?:\/\//i.test(str);
-}
-
-// Helper function to validate files (URLs are always considered valid)
-function validateFiles(files) {
-  const missing = [];
-  const fileArray = Array.isArray(files) ? files : [files];
-  
-  for (const file of fileArray) {
-    if (file && !isURL(file) && !fs.existsSync(file)) {
-      missing.push(file);
-    }
-  }
-  return missing;
-}
+if (!fs.existsSync("./merge")) fs.mkdirSync("./merge");
 
 function getResolution(device) {
   switch (device) {
@@ -43,82 +21,57 @@ function getResolution(device) {
   }
 }
 
-// ---------------- VIDEO MERGE ENDPOINT ----------------
+// ---------------- VIDEO MERGE ----------------
 app.post("/vdo/merge", async (req, res) => {
   try {
-    const { filename, inputvdo, inputaud, subtitle, device } = req.body;
-
-    if (!filename || !inputvdo || !inputaud) {
-      return res.status(400).json({ 
-        error: "Missing required fields: filename, inputvdo, inputaud" 
-      });
-    }
-
-    // Validate that all LOCAL files exist (URLs are skipped)
-    const missingVideos = validateFiles(inputvdo);
-    const missingAudio = validateFiles(inputaud);
-    const missingSubtitle = subtitle ? validateFiles(subtitle) : [];
-    
-    const allMissing = [...missingVideos, ...missingAudio, ...missingSubtitle];
-    
-    if (allMissing.length > 0) {
-      return res.status(404).json({ 
-        error: "Local files not found",
-        missing: allMissing,
-        note: "URLs are processed directly without validation"
-      });
-    }
+    const { filename, inputvdo, inputaud, inputbgm, subtitle, device } = req.body;
 
     const resolution = getResolution(device);
     const output = `./merge/${filename}`;
-    const listFile = "./video_list.txt";
-    const tempOutput = "./merge/tmp.mp4";
 
     // Create temporary concat list
-    // For URLs, use them directly. For local files, use absolute paths
-    const processedPaths = inputvdo.map(v => 
-      isURL(v) ? v : path.resolve(v)
-    );
-    fs.writeFileSync(listFile, processedPaths.map(v => `file '${v}'`).join("\n"));
+    const listFile = "./video_list.txt";
+    fs.writeFileSync(listFile, inputvdo.map(v => `file '${v}'`).join("\n"));
 
-    console.log(`📹 Merging ${inputvdo.length} videos (URLs and/or local files)...`);
-    inputvdo.forEach((v, i) => {
-      console.log(`   ${i + 1}. ${isURL(v) ? '🌐 URL' : '📁 Local'}: ${v}`);
-    });
+    const tempOutput = "./merge/tmp.mp4";
 
-    // Step 1: Merge videos
+    // Step 1 = merge videos
     await new Promise((resolve, reject) => {
       ffmpeg()
         .input(listFile)
         .inputOptions(["-f", "concat", "-safe", "0"])
         .outputOptions(["-c", "copy"])
         .save(tempOutput)
-        .on("end", () => {
-          console.log("✅ Videos merged");
-          resolve();
-        })
+        .on("end", resolve)
         .on("error", reject);
     });
 
-    console.log("🎵 Adding audio and processing...");
-
-    // Process audio input (URL or local file)
-    const audioInput = isURL(inputaud) ? inputaud : path.resolve(inputaud);
-    console.log(`   Audio: ${isURL(inputaud) ? '🌐 URL' : '📁 Local'}: ${inputaud}`);
-
-    // Step 2: Add audio (full volume) + scale + subtitles (video audio muted)
+    // Step 2 = add audio (main 100% + bgm 10%) + subtitles + scaling
     await new Promise((resolve, reject) => {
-      const filters = [
+      let cmd = ffmpeg(tempOutput)
+        .input(inputaud);
+
+      // Add background music if provided
+      if (inputbgm) {
+        cmd.input(inputbgm);
+      }
+
+      const videoFilters = [
         `scale=${resolution}`,
-        subtitle ? `subtitles='${isURL(subtitle) ? subtitle : path.resolve(subtitle)}':force_style='FontSize=32,Outline=1,Shadow=1'` : null
+        subtitle ? `subtitles='${subtitle}':force_style='FontSize=32,Outline=1,Shadow=1'` : null
       ].filter(Boolean);
 
-      const cmd = ffmpeg(tempOutput)
-        .input(audioInput)
-        .videoFilters(filters)
+      // Audio filter: main audio at 100%, bgm at 10%, then mix
+      const audioFilter = inputbgm 
+        ? "[1:a]volume=1.0[a1];[2:a]volume=0.1[a2];[a1][a2]amix=inputs=2:duration=shortest[aout]"
+        : "[1:a]volume=1.0[aout]";
+
+      cmd
+        .videoFilters(videoFilters)
+        .complexFilter(audioFilter)
         .outputOptions([
-          "-map", "0:v",           // Video from merged file (NO AUDIO)
-          "-map", "1:a",           // Audio from audio file (FULL VOLUME)
+          "-map", "0:v",           // Map video from merged video
+          "-map", "[aout]",        // Map mixed audio
           "-c:v", "libx264",
           "-preset", "veryfast",
           "-crf", "22",
@@ -127,103 +80,63 @@ app.post("/vdo/merge", async (req, res) => {
           "-shortest"
         ])
         .save(output)
-        .on("progress", (progress) => {
-          if (progress.percent) {
-            console.log(`   Processing: ${Math.round(progress.percent)}%`);
-          }
-        })
-        .on("end", () => {
-          console.log("✅ Final video created");
-          resolve();
-        })
+        .on("end", resolve)
         .on("error", reject);
     });
 
-    // Cleanup
     fs.unlinkSync(listFile);
     fs.unlinkSync(tempOutput);
 
-    // Get video info
     ffmpeg.ffprobe(output, (err, data) => {
-      if (err) {
-        return res.status(500).json({ error: "Failed to probe video" });
-      }
-      
       return res.json({
         status: "success",
         file: filename,
-        url: `${req.protocol}://${req.get('host')}/merge/${filename}`,
-        duration: data.format.duration,
-        resolution: resolution,
-        inputs: {
-          videos: inputvdo.length,
-          audio: isURL(inputaud) ? "URL" : "Local file",
-          subtitle: subtitle ? (isURL(subtitle) ? "URL" : "Local file") : "None"
-        }
+        url: `http://localhost:3000/merge/${filename}`,
+        duration: data.format.duration
       });
     });
 
   } catch (err) {
-    console.error("❌ Error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// ---------------- IMAGE SLIDESHOW MERGE ENDPOINT ----------------
+// ---------------- IMAGE / SLIDESHOW MERGE ----------------
 app.post("/img/merge", async (req, res) => {
   try {
-    const { filename, inputvdo, inputaud, subtitle, device } = req.body;
-
-    if (!filename || !inputvdo || !inputaud) {
-      return res.status(400).json({ 
-        error: "Missing required fields: filename, inputvdo, inputaud" 
-      });
-    }
-
-    // Validate that all LOCAL files exist (URLs are skipped)
-    const missingImages = validateFiles(inputvdo);
-    const missingAudio = validateFiles(inputaud);
-    const missingSubtitle = subtitle ? validateFiles(subtitle) : [];
-    
-    const allMissing = [...missingImages, ...missingAudio, ...missingSubtitle];
-    
-    if (allMissing.length > 0) {
-      return res.status(404).json({ 
-        error: "Local files not found",
-        missing: allMissing,
-        note: "URLs are processed directly without validation"
-      });
-    }
+    const { filename, inputvdo, inputaud, inputbgm, subtitle, device } = req.body;
 
     const resolution = getResolution(device);
     const output = `./merge/${filename}`;
 
-    console.log(`🖼️  Creating slideshow from ${inputvdo.length} images...`);
-    inputvdo.forEach((img, i) => {
-      console.log(`   ${i + 1}. ${isURL(img) ? '🌐 URL' : '📁 Local'}: ${img}`);
-    });
-
     let cmd = ffmpeg();
-    
-    // Add each image (URL or local file)
-    inputvdo.forEach(img => {
-      const input = isURL(img) ? img : path.resolve(img);
-      cmd.input(input);
-    });
-    
-    // Add audio (URL or local file)
-    const audioInput = isURL(inputaud) ? inputaud : path.resolve(inputaud);
-    cmd.input(audioInput);
-    console.log(`   Audio: ${isURL(inputaud) ? '🌐 URL' : '📁 Local'}: ${inputaud}`);
+    inputvdo.forEach(img => cmd.input(img));
+    cmd.input(inputaud);
 
-    const filters = [
+    // Add background music if provided
+    if (inputbgm) {
+      cmd.input(inputbgm);
+    }
+
+    const videoFilters = [
       `scale=${resolution}`,
-      subtitle ? `subtitles='${isURL(subtitle) ? subtitle : path.resolve(subtitle)}':force_style='FontSize=32,Outline=1,Shadow=1'` : null
+      subtitle ? `subtitles='${subtitle}':force_style='FontSize=32,Outline=1,Shadow=1'` : null
     ].filter(Boolean);
 
+    // Audio filter for images: main audio at 100%, bgm at 10%
+    const audioInputIndex = inputvdo.length;
+    const bgmInputIndex = inputvdo.length + 1;
+    
+    const audioFilter = inputbgm
+      ? `[${audioInputIndex}:a]volume=1.0[a1];[${bgmInputIndex}:a]volume=0.1[a2];[a1][a2]amix=inputs=2:duration=shortest[aout]`
+      : `[${audioInputIndex}:a]volume=1.0[aout]`;
+
     cmd
-      .videoFilters(filters)
+      .videoFilters(videoFilters)
+      .complexFilter(audioFilter)
       .outputOptions([
+        "-map", "0:v",           // Map video from images
+        "-map", "[aout]",        // Map mixed audio
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "22",
@@ -231,61 +144,22 @@ app.post("/img/merge", async (req, res) => {
         "-b:a", "192k",
         "-shortest"
       ])
-      .on("progress", (progress) => {
-        if (progress.percent) {
-          console.log(`   Processing: ${Math.round(progress.percent)}%`);
-        }
-      })
       .save(output)
       .on("end", () => {
-        console.log("✅ Slideshow created");
-        
         ffmpeg.ffprobe(output, (err, data) => {
-          if (err) {
-            return res.status(500).json({ error: "Failed to probe video" });
-          }
-          
           return res.json({
             status: "success",
             file: filename,
-            url: `${req.protocol}://${req.get('host')}/merge/${filename}`,
-            duration: data.format.duration,
-            resolution: resolution,
-            inputs: {
-              images: inputvdo.length,
-              audio: isURL(inputaud) ? "URL" : "Local file",
-              subtitle: subtitle ? (isURL(subtitle) ? "URL" : "Local file") : "None"
-            }
+            url: `http://localhost:3000/merge/${filename}`,
+            duration: data.format.duration
           });
         });
       })
-      .on("error", err => {
-        console.error("❌ Error:", err.message);
-        res.status(500).json({ error: err.message });
-      });
+      .on("error", err => res.status(500).json({ error: err.message }));
 
   } catch (err) {
-    console.error("❌ Error:", err.message);
     return res.status(500).json({ error: err.message });
   }
 });
 
-// ---------------- HEALTH CHECK ----------------
-app.get("/health", (req, res) => {
-  res.json({ 
-    status: "OK", 
-    message: "Video Merger Server is running",
-    timestamp: new Date().toISOString(),
-    features: ["Local files", "Remote URLs", "Mixed inputs"]
-  });
-});
-
-// Start server
-app.listen(PORT, () => {
-  console.log("=================================");
-  console.log(`✅ Server running on port ${PORT}`);
-  console.log(`🌐 http://localhost:${PORT}`);
-  console.log(`📁 Supports: Local files`);
-  console.log(`🌐 Supports: Remote URLs`);
-  console.log("=================================");
-});
+app.listen(3000, () => console.log("✅ Server running on port 3000"));
