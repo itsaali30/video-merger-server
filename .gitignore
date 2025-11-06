@@ -1,0 +1,23 @@
+# Node modules
+node_modules/
+
+# Environment variables
+.env
+
+# Output folder
+merge/
+*.mp4
+*.mp3
+*.srt
+
+# Temp files
+video_list.txt
+tmp.mp4
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
